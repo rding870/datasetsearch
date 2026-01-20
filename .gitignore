@@ -1,6 +1,7 @@
 # Dataset discovery outputs
 *.json
 *.md
+*.db
 
 # Downloaded datasets
 datasets/

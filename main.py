@@ -10,10 +10,11 @@ from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, asdict
 from datetime import datetime
 import anthropic
-from huggingface_hub import HfApi, list_datasets, snapshot_download
+from huggingface_hub import HfApi, list_datasets
 from PIL import Image
 import random
 from dotenv import load_dotenv
+from database import DatasetDatabase
 
 # Load environment variables from .env file
 load_dotenv()
@@ -28,10 +29,6 @@ class DatasetRecord:
     heuristic_score: float
     llm_evaluation: Optional[str]
     is_useful: bool
-    download_status: str
-    multimodal_summary: Optional[str]
-    sample_analysis: Optional[List[Dict[str, Any]]]
-
 
 class HFSearchTool:
     """Tool for discovering datasets on Hugging Face Hub"""
@@ -39,22 +36,29 @@ class HFSearchTool:
     def __init__(self, hf_token: Optional[str] = None):
         self.api = HfApi(token=hf_token)
 
-    def search_datasets(self, keywords: List[str], max_results: int = 50, apply_filter: bool = False) -> List[Dict[str, Any]]:
+    def search_datasets(self, keywords: List[str], max_results: int = 50) -> List[Dict[str, Any]]:
         """Search for image datasets matching criteria
 
         Args:
             keywords: List of keywords to search for
             max_results: Maximum number of results to return
-            apply_filter: If True, only search image-classification datasets
         """
-        print(f"🔍 Searching for datasets with keywords: {keywords}")
-        if apply_filter:
-            print(f"🔧 Filter enabled: image-classification only")
-
         results = []
 
-        # Try searching with keyword-based queries first
-        for keyword in keywords:
+        # Expand keywords with related search terms
+        expanded_keywords = keywords.copy()
+
+        # Add common dataset names if searching for deepfakes/synthetic media
+        deepfake_dataset_names = ['faceforensics', 'dfdc', 'celeb-df', 'deepfakes',
+                                   'dfdm', 'deeperforensics', 'genface', 'openfake']
+        ai_gen_dataset_names = ['laion', 'dragon', 'synthetic', 'generated',
+                               'diffusion', 'stable-diffusion', 'dalle']
+
+        expanded_keywords.extend(deepfake_dataset_names)
+        expanded_keywords.extend(ai_gen_dataset_names)
+
+        # Try searching with keyword-based queries
+        for keyword in expanded_keywords:
             try:
                 # Build search parameters
                 search_params = {
@@ -64,9 +68,15 @@ class HFSearchTool:
                     "limit": max_results
                 }
 
-                # Add filter if requested
-                if apply_filter:
-                    search_params["filter"] = "task_categories:image-classification"
+                filters = [
+                    "modality:image",
+                ]
+                    # Try each filter (HF API may only support one at a time)
+                for filter_term in filters:
+                    try:
+                        search_params["filter"] = filter_term
+                    except:
+                        continue
 
                 for dataset in list_datasets(**search_params):
                     # Basic heuristic filtering
@@ -94,7 +104,6 @@ class HFSearchTool:
         print(f"✅ Found {len(results)} matching datasets")
         return results
 
-
 class DatasetReaderTool:
     """Tool for reading dataset documentation and metadata"""
 
@@ -115,14 +124,80 @@ class DatasetReaderTool:
             except Exception:
                 readme = "No README available"
 
+            created_at = getattr(dataset_info, 'created_at', None)
+            last_modified = getattr(dataset_info, 'last_modified', None)
+
+            # Extract dataset_info and card_data
+            num_rows = None
+            features = {}
+            splits = {}
+            download_size = None
+            dataset_size = None
+
+            card_data_dict = dataset_info.card_data.__dict__ if dataset_info.card_data else {}
+
+            # Extract structured info from dataset_info
+            if 'dataset_info' in card_data_dict and card_data_dict['dataset_info']:
+                dataset_info_data = card_data_dict['dataset_info']
+                if isinstance(dataset_info_data, dict):
+                    features = dataset_info_data.get('features', {})
+                    splits_raw = dataset_info_data.get('splits', [])
+                    download_size = dataset_info_data.get('download_size', None)
+                    dataset_size = dataset_info_data.get('dataset_size', None)
+
+                    # Calculate total rows from splits (can be dict or list)
+                    if isinstance(splits_raw, dict):
+                        splits = splits_raw
+                        num_rows = sum(split.get('num_examples', 0) for split in splits.values() if isinstance(split, dict))
+                        print(f"  Found splits (dict): {list(splits.keys())}, total rows: {num_rows}")
+                    elif isinstance(splits_raw, list):
+                        # Convert list to dict for storage: [{name: 'train', num_examples: 100}] -> {'train': {'num_examples': 100}}
+                        splits = {s.get('name', f'split_{i}'): s for i, s in enumerate(splits_raw) if isinstance(s, dict)}
+                        num_rows = sum(s.get('num_examples', 0) for s in splits_raw if isinstance(s, dict))
+                        print(f"  Found splits (list): {[s.get('name', '?') for s in splits_raw]}, total rows: {num_rows}")
+                        print(f"  Raw splits data: {splits_raw}")
+
+            # Fallback: check alternative attributes
+            if num_rows is None:
+                # Debug: print what attributes are available
+                print(f"  Debug: Available attributes for {dataset_id}:")
+                print(f"    card_data keys: {list(card_data_dict.keys())}")
+                if 'dataset_info' in card_data_dict:
+                    print(f"    dataset_info type: {type(card_data_dict['dataset_info'])}")
+                    if card_data_dict['dataset_info']:
+                        print(f"    dataset_info content sample: {str(card_data_dict['dataset_info'])[:200]}")
+
+                # Try common attributes
+                for attr in ['num_rows', 'dataset_size', 'size']:
+                    if hasattr(dataset_info, attr):
+                        val = getattr(dataset_info, attr)
+                        print(f"    Found {attr}: {val}")
+                        if isinstance(val, int):
+                            num_rows = val
+                            break
+
+            # Separate structured tags (with ':') from user tags
+            all_tags = dataset_info.tags or []
+            user_tags = [tag for tag in all_tags if ':' not in tag]
+            structured_tags = {tag.split(':', 1)[0]: tag.split(':', 1)[1] for tag in all_tags if ':' in tag}
+
             metadata = {
                 'id': dataset_id,
                 'description': getattr(dataset_info, 'description', ''),
-                'tags': dataset_info.tags or [],
-                'card_data': dataset_info.card_data.__dict__ if dataset_info.card_data else {},
-                'readme': readme[:2000],  # Truncate for brevity
+                'tags': user_tags,
+                'structured_tags': structured_tags,
+                'readme': readme[:2000],
                 'siblings': [f.rfilename for f in (dataset_info.siblings or [])[:10]],
                 'downloads': getattr(dataset_info, 'downloads', 0),
+                'likes': getattr(dataset_info, 'likes', 0),
+                'created_at': created_at.isoformat() if created_at else None,
+                'last_modified': last_modified.isoformat() if last_modified else None,
+                'author': getattr(dataset_info, 'author', ''),
+                'num_rows': num_rows,
+                'features': features,
+                'splits': splits,
+                'download_size': download_size,
+                'dataset_size': dataset_size,
             }
 
             print(f"✅ Read metadata for {dataset_id}")
@@ -139,49 +214,59 @@ class EvaluatorTool:
     def __init__(self, api_key: str):
         self.client = anthropic.Anthropic(api_key=api_key)
 
-    def calculate_heuristic_score(self, keywords: List[str], metadata: Dict[str, Any], require_english: bool = True) -> float:
+    def calculate_heuristic_score(self, keywords: List[str], metadata: Dict[str, Any]) -> float:
         """Simple heuristic scoring with keyword relevance"""
         score = 0.0
 
-        # Keyword relevance check (MOST IMPORTANT)
-        dataset_text = f"{metadata.get('id', '')} {metadata.get('description', '')} {metadata.get('readme', '')}".lower()
+        # Keyword relevance check 
+        # Handle None values for text fields
+        dataset_id = metadata.get('id', '') or ''
+        description = metadata.get('description', '') or ''
+        readme = metadata.get('readme', '') or ''
+
+        dataset_text = f"{dataset_id} {description} {readme}".lower()
         tags_text = ' '.join(metadata.get('tags', [])).lower()
 
-        # Debug: Print what we're searching
-        print(f"🔍 DEBUG - Checking keywords: {keywords}")
-        print(f"🔍 DEBUG - Dataset ID in text: '{metadata.get('id', '')}'")
-        print(f"🔍 DEBUG - Description length: {len(metadata.get('description', ''))}")
-        print(f"🔍 DEBUG - README length: {len(metadata.get('readme', ''))}")
+        # Expanded keyword matching with semantic relevance
+        # Core terms for deepfake datasets
+        deepfake_terms = ['deepfake', 'deep fake', 'faceswap', 'face swap', 'face-swap',
+                          'face forgery', 'facial forgery', 'deepfakes', 'dfdc', 'faceforensics',
+                          'celeb-df', 'face manipulation', 'video forgery']
 
+        # Core terms for AI-generated imagery
+        ai_gen_terms = ['synthetic', 'generated', 'gan', 'diffusion', 'stable diffusion',
+                       'dalle', 'dall-e', 'midjourney', 'imagen', 'ai-generated',
+                       'ai generated', 'text-to-image', 'text to image', 'aigc',
+                       'fake face', 'fake image', 'generative', 'stylegan']
+
+        # Detection-related terms
+        detection_terms = ['detection', 'detector', 'forensic', 'forgery detection',
+                          'fake detection', 'authenticity', 'manipulation detection']
+
+        # Model names to look for
+        model_names = ['faceswap', 'face2face', 'neuraltextures', 'deepfacelab',
+                      'stylegan', 'progan', 'biggan', 'vqgan', 'ldm', 'glide', 'flux']
+
+        # Combine all relevant terms
+        all_relevant_terms = deepfake_terms + ai_gen_terms + detection_terms + model_names
+
+        # Count keyword matches (original keywords)
         keyword_matches = sum(1 for kw in keywords if kw.lower() in dataset_text or kw.lower() in tags_text)
-        print(f"🔍 DEBUG - Keyword matches found: {keyword_matches}")
 
-        # If no keywords match, return 0 (not relevant)
-        if keyword_matches == 0:
+        # Count semantic matches (related terms)
+        semantic_matches = sum(1 for term in all_relevant_terms if term.lower() in dataset_text or term.lower() in tags_text)
+
+        # More flexible matching: accept if either keywords OR semantic terms match
+        if keyword_matches == 0 and semantic_matches == 0:
             return 0.0
 
-        # Check for English language (optional filter)
-        if require_english:
-            # Check if dataset has English language tag
-            tags = metadata.get('tags', [])
-            has_english_tag = any('english' in str(tag).lower() or 'en' == str(tag).lower() for tag in tags)
-
-            # Check card_data for language info
-            card_data = metadata.get('card_data', {})
-            languages = card_data.get('language', []) if isinstance(card_data.get('language'), list) else [card_data.get('language', '')]
-            has_english_in_card = any('en' in str(lang).lower() or 'english' in str(lang).lower() for lang in languages if lang)
-
-            # If dataset explicitly specifies non-English only, penalize heavily
-            if tags and not has_english_tag and not has_english_in_card:
-                # Check for other language tags
-                non_english_languages = ['korean', 'ko', 'chinese', 'zh', 'japanese', 'ja', 'french', 'fr', 'german', 'de']
-                has_non_english = any(lang in str(tags).lower() for lang in non_english_languages)
-                if has_non_english:
-                    score *= 0.3  # Reduce score significantly for non-English datasets
-
         # Strong keyword match bonus
-        keyword_ratio = keyword_matches / len(keywords)
+        keyword_ratio = keyword_matches / len(keywords) if keywords else 0
         score += keyword_ratio * 0.5  # Up to 0.5 points for keyword matches
+
+        # Semantic relevance bonus
+        semantic_ratio = min(semantic_matches / 5.0, 1.0)  # Cap at 5 matches
+        score += semantic_ratio * 0.3  # Up to 0.3 points for semantic matches
 
         # Downloads and likes
         downloads = metadata.get('downloads', 0)
@@ -206,170 +291,104 @@ class EvaluatorTool:
         """Use LLM to evaluate dataset usefulness"""
         print(f"🤖 LLM evaluating: {metadata['id']}")
 
-        prompt = f"""Evaluate this Hugging Face image dataset for relevance to the specified keywords.
+        # Handle None values safely
+        description = metadata.get('description') or 'N/A'
+        readme = metadata.get('readme') or 'N/A'
 
-**REQUIRED KEYWORDS:** {', '.join(keywords)}
+        prompt = f"""Evaluate this dataset for training a computer vision ML system to distinguish between real imagery and deepfake/AI-generated imagery.
 
 Dataset ID: {metadata['id']}
+Author: {metadata.get('author', 'Unknown')}
 Tags: {metadata.get('tags', [])}
 Downloads: {metadata.get('downloads', 0)}
-Description: {metadata.get('description', 'N/A')[:500]}
-README excerpt: {metadata.get('readme', 'N/A')[:1000]}
+Likes: {metadata.get('likes', 0)}
+Created: {metadata.get('created_at', 'Unknown')}
+Last Modified: {metadata.get('last_modified', 'Unknown')}
+Files: {metadata.get('siblings', [])[:5]}
+Description: {description[:500]}
+README excerpt: {readme[:2000]}
 
-CRITICAL REQUIREMENTS:
-1. The dataset MUST be directly related to at least one of the keywords: {', '.join(keywords)}
-2. If the keywords include specific subjects (e.g., "potato", "flower", "car"), the dataset MUST contain images of those subjects
-3. Generic image classification datasets are NOT acceptable unless they specifically cover the keywords
-4. The dataset documentation SHOULD be primarily in English (prefer datasets with English READMEs and descriptions)
+Evaluate the following criteria:
 
-Provide:
-1. Does this dataset SPECIFICALLY contain or focus on the required keywords? (Yes/No)
-2. Which keywords (if any) does this dataset cover?
-3. Is the documentation primarily in English?
-4. Brief reasoning (2-3 sentences)
+1. RELEVANCE: Is this dataset relevant for training deepfake/AI-gen detection?
+   - Must contain BOTH real images AND deepfake/AI-generated images with labels (0=real, 1=fake)
+   - Or contain only deepfakes/AI-gen if clearly labeled
 
-Format: DECISION: [Yes/No] | KEYWORDS_FOUND: [list] | LANGUAGE: [English/Other] | REASONING: [your reasoning]"""
+2. QUALITY & DOCUMENTATION:
+   - Is the dataset well-maintained with good documentation?
+   - How/where was data collected? Is this documented?
+   - Which deepfake methods or AI models were used to generate fake images? (FaceSwap, Stable Diffusion, etc.)
+
+3. QUANTITY:
+   - How many images total? (estimate from docs)
+   - Image resolution (width x height)?
+
+4. LABELS:
+   - How are images labeled? (CSV file, folder structure, metadata, etc.)
+   - Is labeling robust and clear? (0=real, 1=fake convention?)
+
+5. POPULARITY & CREDIBILITY:
+   - Download count: {metadata.get('downloads', 0)}
+   - Connected to research papers?
+   - Publication date/recency?
+
+6. OTHER HELPFUL INFO:
+   - Any concerns (data quality, bias, ethical issues)?
+   - Unique strengths?
+
+Format your response as:
+DECISION: [Yes/No]
+RELEVANCE: [High/Medium/Low] - [why]
+QUALITY: [High/Medium/Low] - [documentation quality, generation methods used]
+QUANTITY: [# images, resolution]
+LABELS: [format, robustness]
+CREDIBILITY: [downloads, papers, date]
+CONCERNS: [any red flags]
+STRENGTHS: [unique benefits]
+REASONING: [2-3 sentence summary]"""
 
         try:
             message = self.client.messages.create(
                 model="claude-3-5-haiku-20241022",
-                max_tokens=300,
+                max_tokens=800,
                 messages=[{"role": "user", "content": prompt}]
             )
 
             response = message.content[0].text
-            is_useful = 'DECISION: Yes' in response
+            # Check for Yes in the decision line (handles "Yes", "Tentative Yes", etc.)
+            is_useful = 'DECISION:' in response and 'Yes' in response.split('DECISION:')[1].split('\n')[0]
 
             print(f"✅ LLM Decision: {'Useful' if is_useful else 'Not useful'}")
+            print(f"📝 Reasoning: {response}")
             return is_useful, response
 
         except Exception as e:
             print(f"❌ LLM evaluation failed: {e}")
             return False, f"Evaluation failed: {e}"
 
-
-class DownloaderTool:
-    """Tool for downloading datasets"""
-
-    def __init__(self, hf_token: Optional[str] = None, download_dir: str = "./datasets"):
-        self.hf_token = hf_token
-        self.download_dir = download_dir
-        os.makedirs(download_dir, exist_ok=True)
-
-    def download_dataset(self, dataset_id: str, sample_only: bool = True) -> str:
-        """Download dataset (or sample)"""
-        print(f"⬇️  Downloading dataset: {dataset_id}")
-
-        try:
-            if sample_only:
-                # Only download a subset for analysis
-                path = snapshot_download(
-                    repo_id=dataset_id,
-                    repo_type="dataset",
-                    token=self.hf_token,
-                    local_dir=os.path.join(self.download_dir, dataset_id.replace('/', '_')),
-                    allow_patterns=["*.jpg", "*.png", "*.jpeg"],
-                    max_workers=2,
-                )
-            else:
-                path = snapshot_download(
-                    repo_id=dataset_id,
-                    repo_type="dataset",
-                    token=self.hf_token,
-                    local_dir=os.path.join(self.download_dir, dataset_id.replace('/', '_')),
-                )
-
-            print(f"✅ Downloaded to: {path}")
-            return f"Downloaded: {path}"
-
-        except Exception as e:
-            print(f"❌ Download failed: {e}")
-            return f"Failed: {e}"
-
-
-class MultimodalAnalyzer:
-    """Multimodal LLM analyzer for image understanding"""
-
-    def __init__(self, api_key: str):
-        self.client = anthropic.Anthropic(api_key=api_key)
-
-    def analyze_images(self, dataset_path: str, num_samples: int = 3) -> Dict[str, Any]:
-        """Analyze sample images from dataset"""
-        print(f"🖼️  Analyzing images from: {dataset_path}")
-
-        # Find image files
-        image_files = []
-        for root, dirs, files in os.walk(dataset_path):
-            for file in files:
-                if file.lower().endswith(('.jpg', '.jpeg', '.png')):
-                    image_files.append(os.path.join(root, file))
-                if len(image_files) >= num_samples:
-                    break
-            if len(image_files) >= num_samples:
-                break
-
-        if not image_files:
-            print("❌ No images found")
-            return {'summary': 'No images found', 'samples': []}
-
-        # Sample random images
-        sampled = random.sample(image_files, min(num_samples, len(image_files)))
-
-        # Analyze images (metadata only for minimal version)
-        samples = []
-        for img_path in sampled:
-            try:
-                with Image.open(img_path) as img:
-                    samples.append({
-                        'path': img_path,
-                        'size': img.size,
-                        'format': img.format,
-                        'mode': img.mode,
-                    })
-            except Exception as e:
-                samples.append({'path': img_path, 'error': str(e)})
-
-        summary = f"Analyzed {len(samples)} images. Formats: {set(s.get('format', 'unknown') for s in samples)}"
-        print(f"✅ {summary}")
-
-        return {
-            'summary': summary,
-            'samples': samples
-        }
-
-
 class AgentOrchestrator:
     """Central orchestrator for the agentic pipeline"""
 
-    def __init__(self, hf_token: Optional[str] = None, anthropic_api_key: Optional[str] = None):
+    def __init__(self, hf_token: Optional[str] = None, anthropic_api_key: Optional[str] = None, db_path: str = "datasets.db"):
         self.search_tool = HFSearchTool(hf_token)
         self.reader_tool = DatasetReaderTool(hf_token)
         self.evaluator = EvaluatorTool(anthropic_api_key) if anthropic_api_key else None
-        self.downloader = DownloaderTool(hf_token)
-        self.analyzer = MultimodalAnalyzer(anthropic_api_key) if anthropic_api_key else None
         self.records: List[DatasetRecord] = []
+        self.db = DatasetDatabase(db_path)
 
-    def run_pipeline(self, keywords: List[str], max_datasets: int = 10, download_useful: bool = True, apply_filter: bool = False):
+    def run_pipeline(self, keywords: List[str], max_datasets: int = 10):
         """Execute the full pipeline
 
         Args:
             keywords: Keywords to search for
             max_datasets: Maximum number of datasets to process
-            download_useful: Whether to download datasets marked as useful
-            apply_filter: If True, only search image-classification datasets
         """
-        print("\n" + "="*60)
-        print("🚀 Starting Agentic Dataset Discovery Pipeline")
-        print("="*60 + "\n")
 
         # Step 1: Search
-        datasets = self.search_tool.search_datasets(keywords, max_results=max_datasets, apply_filter=apply_filter)
+        datasets = self.search_tool.search_datasets(keywords, max_results=max_datasets)
 
         for dataset_info in datasets[:max_datasets]:
             dataset_id = dataset_info['id']
-            print(f"\n{'─'*60}")
-            print(f"Processing: {dataset_id}")
-            print(f"{'─'*60}")
 
             # Step 2: Read metadata
             metadata = self.reader_tool.read_dataset(dataset_id)
@@ -390,88 +409,129 @@ class AgentOrchestrator:
             else:
                 print(f"⏭️  Skipped: No keyword match found")
 
-            # Step 4: Download if useful
-            download_status = "skipped"
-            multimodal_summary = None
-            sample_analysis = None
+            if is_useful:
+                # Check if high quality - download and analyze samples
+                image_quality_approved = True  # Default to true for datasets that don't require image check
 
-            if is_useful and download_useful:
-                download_status = self.downloader.download_dataset(dataset_id, sample_only=True)
+                if llm_evaluation and 'RELEVANCE: High' in llm_evaluation and 'QUALITY: High' in llm_evaluation:
+                    print(f"🌟 High-quality dataset detected! Downloading 20 sample images for analysis...")
+                    try:
+                        # Get list of files first without downloading
+                        from huggingface_hub import HfFileSystem
+                        fs = HfFileSystem()
+                        files = fs.ls(f"datasets/{dataset_id}", detail=False, recursive=True)
 
-                # Step 5: Analyze images
-                if self.analyzer and "Downloaded:" in download_status:
-                    dataset_path = download_status.split("Downloaded: ")[1]
-                    analysis = self.analyzer.analyze_images(dataset_path)
-                    multimodal_summary = analysis['summary']
-                    sample_analysis = analysis['samples']
+                        # Filter for images
+                        image_files = [f for f in files if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
 
-            # Create record
-            record = DatasetRecord(
-                dataset_id=dataset_id,
-                discovered_at=datetime.now().isoformat(),
-                metadata=metadata,
-                heuristic_score=heuristic_score,
-                llm_evaluation=llm_evaluation,
-                is_useful=is_useful,
-                download_status=download_status,
-                multimodal_summary=multimodal_summary,
-                sample_analysis=sample_analysis
-            )
+                        # Sample 20 random images
+                        if len(image_files) > 20:
+                            sampled_files = random.sample(image_files, 20)
+                        else:
+                            sampled_files = image_files
 
-            self.records.append(record)
-            print(f"✅ Record created for {dataset_id}")
+                        # Download only the sampled files
+                        download_dir = f"./datasets/{dataset_id.replace('/', '_')}"
+                        os.makedirs(download_dir, exist_ok=True)
 
-        # Save results
-        self.save_results()
-        self.generate_report()
+                        sampled = []
+                        for file_path in sampled_files[:20]:
+                            # Extract relative path
+                            rel_path = file_path.replace(f"datasets/{dataset_id}/", "")
+                            local_path = os.path.join(download_dir, os.path.basename(rel_path))
+
+                            # Download single file
+                            from huggingface_hub import hf_hub_download
+                            hf_hub_download(
+                                repo_id=dataset_id,
+                                repo_type="dataset",
+                                filename=rel_path,
+                                local_dir=download_dir,
+                                local_dir_use_symlinks=False
+                            )
+                            sampled.append(local_path)
+
+                        if sampled:
+                            print(f"🔍 Analyzing {len(sampled)} sample images...")
+
+                            approved_count = 0
+                            # Analyze all samples with Claude
+                            for img_path in sampled:
+                                try:
+                                    with Image.open(img_path) as img:
+                                        # Encode image for Claude
+                                        import base64
+                                        import io
+                                        buffered = io.BytesIO()
+                                        img.save(buffered, format="PNG")
+                                        img_str = base64.b64encode(buffered.getvalue()).decode()
+
+                                        # Ask Claude to analyze
+                                        response = self.evaluator.client.messages.create(
+                                            model="claude-3-5-haiku-20241022",
+                                            max_tokens=300,
+                                            messages=[{
+                                                "role": "user",
+                                                "content": [
+                                                    {
+                                                        "type": "image",
+                                                        "source": {
+                                                            "type": "base64",
+                                                            "media_type": "image/png",
+                                                            "data": img_str,
+                                                        },
+                                                    },
+                                                    {
+                                                        "type": "text",
+                                                        "text": "Briefly assess image quality for ML training: resolution, clarity, any visible artifacts/issues? Answer with APPROVED or REJECTED followed by brief reason."
+                                                    }
+                                                ]
+                                            }]
+                                        )
+                                        analysis = response.content[0].text
+                                        if 'APPROVED' in analysis.upper():
+                                            approved_count += 1
+                                        print(f"  Sample {sampled.index(img_path)+1}: {analysis[:100]}...")
+                                except Exception as e:
+                                    print(f"  ⚠️ Could not analyze {img_path}: {e}")
+
+                            approval_rate = approved_count / len(sampled) if sampled else 0
+                            print(f"✅ Image quality check: {approved_count}/{len(sampled)} approved ({approval_rate:.1%})")
+
+                            # Check if majority approved
+                            if approval_rate < 0.5:
+                                print(f"⏭️ Dataset rejected: Only {approval_rate:.1%} of images approved")
+                                image_quality_approved = False
+                    except Exception as e:
+                        print(f"⚠️  Sample analysis failed: {e}")
+                        image_quality_approved = False
+
+                # Only add to database if both useful AND image quality approved
+                if image_quality_approved:
+                    # Create record
+                    record = DatasetRecord(
+                        dataset_id=dataset_id,
+                        discovered_at=datetime.now().isoformat(),
+                        metadata=metadata,
+                        heuristic_score=heuristic_score,
+                        llm_evaluation=llm_evaluation,
+                        is_useful=is_useful,
+                    )
+
+                    self.records.append(record)
+                    print(f"✅ Record created for {dataset_id}")
+
+                    # Save to database
+                    self.db.insert_dataset(asdict(record))
+
+                    # Save results to JSON (legacy)
+                    self.save_results()
 
     def save_results(self, output_file: str = "dataset_records.json"):
         """Save structured records to JSON"""
         with open(output_file, 'w', encoding='utf-8') as f:
             json.dump([asdict(r) for r in self.records], f, indent=2)
         print(f"\n💾 Saved {len(self.records)} records to {output_file}")
-
-    def generate_report(self, output_file: str = "discovery_report.md"):
-        """Generate research artifact report"""
-        useful_count = sum(1 for r in self.records if r.is_useful)
-
-        # Handle division by zero
-        success_rate = (useful_count / len(self.records) * 100) if len(self.records) > 0 else 0.0
-
-        report = f"""# Hugging Face Image Dataset Discovery Report
-
-**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-
-## Summary
-- **Total Datasets Discovered:** {len(self.records)}
-- **Datasets Marked Useful:** {useful_count}
-- **Success Rate:** {success_rate:.1f}%
-
-## Datasets Analyzed
-
-"""
-        for record in self.records:
-            status = "✅ Useful" if record.is_useful else "❌ Not Useful"
-            report += f"\n### {record.dataset_id} {status}\n"
-            report += f"- **Heuristic Score:** {record.heuristic_score:.2f}\n"
-            report += f"- **Downloads:** {record.metadata.get('downloads', 0)}\n"
-            report += f"- **Download Status:** {record.download_status}\n"
-
-            if record.llm_evaluation:
-                report += f"\n**LLM Evaluation:**\n```\n{record.llm_evaluation[:300]}\n```\n"
-
-            if record.multimodal_summary:
-                report += f"\n**Multimodal Analysis:** {record.multimodal_summary}\n"
-
-        report += "\n## Observations\n\n"
-        report += "- Dataset documentation quality varies significantly\n"
-        report += "- Automated evaluation helps filter high-quality datasets\n"
-        report += "- Multimodal analysis provides valuable insights into dataset composition\n"
-
-        with open(output_file, 'w', encoding='utf-8') as f:
-            f.write(report)
-
-        print(f"📄 Generated report: {output_file}")
 
 
 class Scheduler:
@@ -484,8 +544,6 @@ class Scheduler:
             config: Configuration dict with keys:
                 - keywords: List[str]
                 - max_datasets: int
-                - download_useful: bool
-                - apply_filter: bool
                 - interval_hours: int (default: 24)
         """
         self.orchestrator = orchestrator
@@ -503,8 +561,6 @@ class Scheduler:
             self.orchestrator.run_pipeline(
                 keywords=self.config.get('keywords', ['image']),
                 max_datasets=self.config.get('max_datasets', 10),
-                download_useful=self.config.get('download_useful', True),
-                apply_filter=self.config.get('apply_filter', False)
             )
             print(f"\n✅ Scheduled run #{self.run_count} completed successfully")
         except Exception as e:
@@ -544,10 +600,7 @@ class Scheduler:
                 schedule.run_pending()
                 time.sleep(60)  # Check every minute
         except KeyboardInterrupt:
-            print(f"\n\n{'='*60}")
-            print(f"🛑 Scheduler stopped by user")
-            print(f"📊 Total runs completed: {self.run_count}")
-            print(f"{'='*60}\n")
+            pass
 
 
 def main(use_scheduler: bool = False):
@@ -569,10 +622,8 @@ def main(use_scheduler: bool = False):
     if use_scheduler:
         # Scheduled mode - runs periodically
         scheduler_config = {
-            'keywords': ["dog"],
-            'max_datasets': 5,
-            'download_useful': True,
-            'apply_filter': False,
+            'keywords': ["deepfake", "synthetic media", "face forgery", "AI generated"],
+            'max_datasets': 20,
             'interval_hours': 6  # Run every 6 hours (4 times per day)
         }
 
@@ -581,16 +632,9 @@ def main(use_scheduler: bool = False):
     else:
         # One-time run mode
         orchestrator.run_pipeline(
-            keywords=["dog"],
-            max_datasets=5,
-            download_useful=True,
-            apply_filter=False
+            keywords=["deepfake", "synthetic media", "face forgery", "AI generated"],
+            max_datasets=20,
         )
-
-        print("\n" + "="*60)
-        print("✅ Pipeline completed successfully!")
-        print("="*60)
-
 
 if __name__ == "__main__":
     main()

@@ -5,8 +5,9 @@ Database module for storing dataset metadata and search results
 import sqlite3
 import json
 from typing import List, Dict, Any, Optional
-from datetime import datetime
 from contextlib import contextmanager
+import gspread
+from google.oauth2.service_account import Credentials
 
 
 class DatasetDatabase:
@@ -68,7 +69,14 @@ class DatasetDatabase:
                     features TEXT,
                     splits TEXT,
                     structured_tags TEXT,
-                    siblings TEXT
+                    siblings TEXT,
+
+                    -- Scraped data
+                    full_readme TEXT,
+                    scraped_data TEXT,
+
+                    -- Embedding (JSON array of floats)
+                    embedding TEXT
                 )
             """)
 
@@ -85,66 +93,74 @@ class DatasetDatabase:
 
             print(f"✅ Database initialized: {self.db_path}")
 
-    def insert_dataset(self, record: Dict[str, Any]) -> int:
-        """
-        Insert or update a dataset record
+    def _parse_num_rows(self, value) -> Optional[int]:
+        """Parse num_rows string like '17.4k' into integer"""
+        if not value:
+            return None
+        value = str(value).lower().replace(',', '').strip()
+        try:
+            if 'k' in value:
+                return int(float(value.replace('k', '')) * 1000)
+            elif 'm' in value:
+                return int(float(value.replace('m', '')) * 1000000)
+            return int(float(value))
+        except:
+            return None
 
-        Args:
-            record: Dictionary containing dataset information
-
-        Returns:
-            Row ID of inserted/updated record
-        """
+    def insert_dataset(self, record: Dict[str, Any], embedding: Optional[List[float]] = None) -> int:
+        """Insert or update a dataset record"""
         with self.get_connection() as conn:
             cursor = conn.cursor()
 
-            # Extract metadata
             metadata = record.get('metadata', {})
-
-            # Prepare data
             dataset_id = record['dataset_id']
-            discovered_at = record.get('discovered_at', datetime.now().isoformat())
+            scraped = metadata.get('scraped_data', {}) or {}
 
-            description = metadata.get('description', '')
-            readme = metadata.get('readme', '')
-            downloads = metadata.get('downloads', 0)
-            likes = metadata.get('likes', 0)
-            num_rows = metadata.get('num_rows', None)
-            download_size = metadata.get('download_size', None)
-            dataset_size = metadata.get('dataset_size', None)
-            created_at = metadata.get('created_at', None)
-            last_modified = metadata.get('last_modified', None)
-            author = metadata.get('author', '')
-
-            heuristic_score = record.get('heuristic_score', 0.0)
-            llm_evaluation = record.get('llm_evaluation', '')
+            # Use scraped num_rows as fallback
+            num_rows = metadata.get('num_rows') or self._parse_num_rows(scraped.get('num_rows'))
 
             # JSON fields
             features = json.dumps(metadata.get('features', {}))
             splits = json.dumps(metadata.get('splits', {}))
             structured_tags = json.dumps(metadata.get('structured_tags', {}))
             siblings = json.dumps(metadata.get('siblings', []))
+            scraped_data = json.dumps(scraped) if scraped else None
+            embedding_json = json.dumps(embedding) if embedding else None
 
-            # Insert or replace dataset
             cursor.execute("""
                 INSERT OR REPLACE INTO datasets (
                     dataset_id, discovered_at,
-                    description, readme, downloads, likes, num_rows, download_size, dataset_size, created_at, last_modified, author,
+                    description, readme, downloads, likes, num_rows, download_size, dataset_size,
+                    created_at, last_modified, author,
                     heuristic_score, llm_evaluation,
-                    features, splits, structured_tags, siblings
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    features, splits, structured_tags, siblings,
+                    full_readme, scraped_data, embedding
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                dataset_id, discovered_at,
-                description, readme, downloads, likes, num_rows, download_size, dataset_size, created_at, last_modified, author,
-                heuristic_score, llm_evaluation,
-                features, splits, structured_tags, siblings
+                dataset_id,
+                record.get('discovered_at'),
+                metadata.get('description', ''),
+                metadata.get('readme', ''),
+                metadata.get('downloads', 0),
+                metadata.get('likes', 0),
+                num_rows,
+                metadata.get('download_size'),
+                metadata.get('dataset_size'),
+                metadata.get('created_at'),
+                metadata.get('last_modified'),
+                metadata.get('author', ''),
+                record.get('heuristic_score', 0.0),
+                record.get('llm_evaluation', ''),
+                features, splits, structured_tags, siblings,
+                metadata.get('full_readme'),
+                scraped_data,
+                embedding_json
             ))
 
             row_id = cursor.lastrowid
 
             # Insert tags
-            tags = metadata.get('tags', [])
-            for tag in tags:
+            for tag in metadata.get('tags', []):
                 cursor.execute("INSERT OR IGNORE INTO dataset_tags (dataset_id, tag) VALUES (?, ?)", (dataset_id, tag))
 
             print(f"✅ Inserted dataset: {dataset_id}")
@@ -178,48 +194,76 @@ class DatasetDatabase:
                 'tags': tags
             }
 
-    def get_statistics(self) -> Dict[str, Any]:
-        """Get database statistics"""
+    def export_to_google_sheets(self, spreadsheet_id: str, credentials_file: str = "credentials.json"):
+        """Export all datasets to Google Sheets
+
+        Args:
+            spreadsheet_id: The ID from the Google Sheets URL (between /d/ and /edit)
+            credentials_file: Path to Google service account credentials JSON
+        """
+        # Authenticate with Google
+        scopes = [
+            'https://www.googleapis.com/auth/spreadsheets',
+            'https://www.googleapis.com/auth/drive'
+        ]
+        creds = Credentials.from_service_account_file(credentials_file, scopes=scopes)
+        client = gspread.authorize(creds)
+
+        # Open the spreadsheet
+        spreadsheet = client.open_by_key(spreadsheet_id)
+
+        # Get or create worksheet
+        try:
+            worksheet = spreadsheet.worksheet("Datasets")
+            worksheet.clear()
+        except gspread.WorksheetNotFound:
+            worksheet = spreadsheet.add_worksheet(title="Datasets", rows=1000, cols=15)
+
+        # Get data from database
         with self.get_connection() as conn:
             cursor = conn.cursor()
+            cursor.execute("""
+                SELECT
+                    dataset_id, author, description, downloads, likes, num_rows,
+                    created_at, last_modified, heuristic_score, llm_evaluation,
+                    discovered_at, scraped_data
+                FROM datasets
+                ORDER BY heuristic_score DESC, downloads DESC
+            """)
+            rows = cursor.fetchall()
 
-            # Total datasets
-            cursor.execute("SELECT COUNT(*) as count FROM datasets")
-            total_datasets = cursor.fetchone()['count']
+        # Prepare data for sheets
+        header = [
+            'Dataset ID', 'URL', 'Author', 'Description', 'Downloads', 'Likes',
+            'Num Rows', 'Created At', 'Last Modified', 'Heuristic Score',
+            'Is Relevant', 'License', 'Citation', 'LLM Evaluation', 'Discovered At'
+        ]
 
-            # Average heuristic score
-            cursor.execute("SELECT AVG(heuristic_score) as avg_score FROM datasets")
-            avg_score = cursor.fetchone()['avg_score'] or 0.0
+        data = [header]
+        for row in rows:
+            llm_eval = row['llm_evaluation'] or ''
+            is_relevant = 'Yes' if 'DECISION:' in llm_eval and 'Yes' in llm_eval.split('DECISION:')[1].split('\n')[0] else 'No'
+            scraped = json.loads(row['scraped_data']) if row['scraped_data'] else {}
 
-            # Total downloads
-            cursor.execute("SELECT SUM(downloads) as total FROM datasets")
-            total_downloads = cursor.fetchone()['total'] or 0
+            data.append([
+                row['dataset_id'],
+                f"https://huggingface.co/datasets/{row['dataset_id']}",
+                row['author'] or '',
+                (row['description'] or '')[:200],
+                row['downloads'] or 0,
+                row['likes'] or 0,
+                row['num_rows'] or self._parse_num_rows(scraped.get('num_rows')) or '',
+                row['created_at'] or '',
+                row['last_modified'] or '',
+                row['heuristic_score'] or 0,
+                is_relevant,
+                scraped.get('license', ''),
+                (scraped.get('citation', '') or '')[:300],
+                llm_eval[:500] if llm_eval else '',
+                row['discovered_at'] or ''
+            ])
 
-            # Top tags
-            cursor.execute("SELECT tag, COUNT(*) as count FROM dataset_tags GROUP BY tag ORDER BY count DESC LIMIT 10")
-            top_tags = [dict(r) for r in cursor.fetchall()]
+        # Upload to Google Sheets
+        worksheet.update(data, value_input_option='RAW')
 
-            return {
-                'total_datasets': total_datasets,
-                'average_heuristic_score': avg_score,
-                'total_downloads': total_downloads,
-                'top_tags': top_tags
-            }
-
-    def export_to_json(self, output_file: str = "database_export.json"):
-        """Export all datasets to JSON"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT dataset_id FROM datasets")
-            dataset_ids = [row['dataset_id'] for row in cursor.fetchall()]
-
-            datasets = []
-            for dataset_id in dataset_ids:
-                dataset = self.get_dataset(dataset_id)
-                if dataset:
-                    datasets.append(dataset)
-
-            with open(output_file, 'w', encoding='utf-8') as f:
-                json.dump(datasets, f, indent=2)
-
-            print(f"✅ Exported {len(datasets)} datasets to {output_file}")
+        print(f"Exported {len(rows)} datasets to Google Sheets")

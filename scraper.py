@@ -2,29 +2,20 @@
 Web scraper for extracting additional HuggingFace dataset information
 """
 
+import re
 import requests
 from bs4 import BeautifulSoup
 from typing import Dict, Any
 
 
 def scrape_dataset_page(dataset_id: str) -> Dict[str, Any]:
-    """
-    Scrape additional data from HuggingFace dataset page
-
-    Args:
-        dataset_id: Dataset identifier (e.g., "username/dataset-name")
-
-    Returns:
-        Dictionary with scraped data
-    """
+    """Scrape additional data from HuggingFace dataset page"""
     url = f"https://huggingface.co/datasets/{dataset_id}"
 
     try:
         response = requests.get(url, timeout=10)
         response.raise_for_status()
         soup = BeautifulSoup(response.text, 'html.parser')
-
-        import re
 
         data = {'dataset_id': dataset_id, 'url': url}
 
@@ -52,7 +43,6 @@ def scrape_dataset_page(dataset_id: str) -> Dict[str, Any]:
             data['num_rows'] = size_match.group(1)
 
         print(f"✅ Scraped {dataset_id}")
-        print(data)
         return data
 
     except Exception as e:

@@ -3,23 +3,17 @@ Agentic Pipeline for Automated Discovery and Understanding of Hugging Face Image
 """
 
 import os
-import json
-import time
-import schedule
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, asdict
 from datetime import datetime
 import anthropic
 from huggingface_hub import HfApi, list_datasets
-from PIL import Image
-import random
 from dotenv import load_dotenv
 from database import DatasetDatabase
+from scraper import scrape_dataset_page 
 
 # Load environment variables from .env file
 load_dotenv()
-
-
 @dataclass
 class DatasetRecord:
     """Structured record for each dataset"""
@@ -36,72 +30,75 @@ class HFSearchTool:
     def __init__(self, hf_token: Optional[str] = None):
         self.api = HfApi(token=hf_token)
 
-    def search_datasets(self, keywords: List[str], max_results: int = 50) -> List[Dict[str, Any]]:
+    def search_datasets(self, max_per_keyword: int = 500) -> List[Dict[str, Any]]:
         """Search for image datasets matching criteria
 
         Args:
             keywords: List of keywords to search for
-            max_results: Maximum number of results to return
+            max_per_keyword: Maximum results per keyword search (set high to get all)
         """
         results = []
+        seen_ids = set()
 
         # Expand keywords with related search terms
-        expanded_keywords = keywords.copy()
+        expanded_keywords = ["deepfake", "faceswap", "face forgery", "synthetic face", 
+            "AI generated face", 'deepfake', 'deep-fake', 'deepfakes',
+            'faceswap', 'face-swap', 'face swap',
+            'face forgery', 'facial forgery',
+            'face manipulation', 'face reenactment',
+            'faceforensics', 'ff++',
+            'dfdc', 'celeb-df', 'celebdf', 'deeperforensics', 'dfd',
+            'fake face', 'fake faces',
+            'face2face', 'neuraltextures',
+            'deepfacelab', 'faceswap-gan',
+            'ai generated', 'ai-generated',
+            'synthetic face', 'synthetic faces',
+            'gan face', 'gan generated',
+            'stylegan', 'progan', 'diffusion face',
+        ]
 
-        # Add common dataset names if searching for deepfakes/synthetic media
-        deepfake_dataset_names = ['faceforensics', 'dfdc', 'celeb-df', 'deepfakes',
-                                   'dfdm', 'deeperforensics', 'genface', 'openfake']
-        ai_gen_dataset_names = ['laion', 'dragon', 'synthetic', 'generated',
-                               'diffusion', 'stable-diffusion', 'dalle']
+        # Remove duplicates while preserving order
+        expanded_keywords = list(dict.fromkeys(expanded_keywords))
 
-        expanded_keywords.extend(deepfake_dataset_names)
-        expanded_keywords.extend(ai_gen_dataset_names)
+        print(f"Searching with {len(expanded_keywords)} keywords...")
 
-        # Try searching with keyword-based queries
+        # Search each keyword
         for keyword in expanded_keywords:
             try:
-                # Build search parameters
                 search_params = {
                     "search": keyword,
                     "sort": "downloads",
                     "direction": -1,
-                    "limit": max_results
+                    "limit": max_per_keyword,
+                    "filter": "modality:image",
                 }
 
-                filters = [
-                    "modality:image",
-                ]
-                    # Try each filter (HF API may only support one at a time)
-                for filter_term in filters:
-                    try:
-                        search_params["filter"] = filter_term
-                    except:
+                keyword_count = 0 # Shows how many new datasets each keyword contributed
+                for dataset in list_datasets(**search_params):
+                    dataset_id = dataset.id
+
+                    if dataset_id in seen_ids:
                         continue
 
-                for dataset in list_datasets(**search_params):
-                    # Basic heuristic filtering
+                    seen_ids.add(dataset_id)
+
                     dataset_info = {
-                        'id': dataset.id,
+                        'id': dataset_id,
                         'tags': dataset.tags or [],
                         'downloads': getattr(dataset, 'downloads', 0),
                         'likes': getattr(dataset, 'likes', 0),
                     }
+                    results.append(dataset_info)
+                    keyword_count += 1
 
-                    # Avoid duplicates
-                    if not any(r['id'] == dataset_info['id'] for r in results):
-                        results.append(dataset_info)
-
-                    if len(results) >= max_results:
-                        break
+                if keyword_count > 0:
+                    print(f"  '{keyword}': +{keyword_count} new datasets")
 
             except Exception as e:
-                print(f"⚠️  Search failed for keyword '{keyword}': {e}")
+                print(f"  '{keyword}': failed - {e}")
                 continue
 
-            if len(results) >= max_results:
-                break
-
-        print(f"✅ Found {len(results)} matching datasets")
+        print(f"Found {len(results)} total unique datasets")
         return results
 
 class DatasetReaderTool:
@@ -118,68 +115,26 @@ class DatasetReaderTool:
             dataset_info = self.api.dataset_info(dataset_id)
 
             # Get README content
-            readme = ""
             try:
                 readme = self.api.get_dataset_readme(dataset_id)
             except Exception:
-                readme = "No README available"
+                readme = ""
 
-            created_at = getattr(dataset_info, 'created_at', None)
-            last_modified = getattr(dataset_info, 'last_modified', None)
-
-            # Extract dataset_info and card_data
-            num_rows = None
-            features = {}
-            splits = {}
-            download_size = None
-            dataset_size = None
-
+            # Extract card_data
             card_data_dict = dataset_info.card_data.__dict__ if dataset_info.card_data else {}
+            dataset_info_data = card_data_dict.get('dataset_info', {}) or {}
+            if not isinstance(dataset_info_data, dict):
+                dataset_info_data = {}
 
-            # Extract structured info from dataset_info
-            if 'dataset_info' in card_data_dict and card_data_dict['dataset_info']:
-                dataset_info_data = card_data_dict['dataset_info']
-                if isinstance(dataset_info_data, dict):
-                    features = dataset_info_data.get('features', {})
-                    splits_raw = dataset_info_data.get('splits', [])
-                    download_size = dataset_info_data.get('download_size', None)
-                    dataset_size = dataset_info_data.get('dataset_size', None)
-
-                    # Calculate total rows from splits (can be dict or list)
-                    if isinstance(splits_raw, dict):
-                        splits = splits_raw
-                        num_rows = sum(split.get('num_examples', 0) for split in splits.values() if isinstance(split, dict))
-                        print(f"  Found splits (dict): {list(splits.keys())}, total rows: {num_rows}")
-                    elif isinstance(splits_raw, list):
-                        # Convert list to dict for storage: [{name: 'train', num_examples: 100}] -> {'train': {'num_examples': 100}}
-                        splits = {s.get('name', f'split_{i}'): s for i, s in enumerate(splits_raw) if isinstance(s, dict)}
-                        num_rows = sum(s.get('num_examples', 0) for s in splits_raw if isinstance(s, dict))
-                        print(f"  Found splits (list): {[s.get('name', '?') for s in splits_raw]}, total rows: {num_rows}")
-                        print(f"  Raw splits data: {splits_raw}")
-
-            # Fallback: check alternative attributes
-            if num_rows is None:
-                # Debug: print what attributes are available
-                print(f"  Debug: Available attributes for {dataset_id}:")
-                print(f"    card_data keys: {list(card_data_dict.keys())}")
-                if 'dataset_info' in card_data_dict:
-                    print(f"    dataset_info type: {type(card_data_dict['dataset_info'])}")
-                    if card_data_dict['dataset_info']:
-                        print(f"    dataset_info content sample: {str(card_data_dict['dataset_info'])[:200]}")
-
-                # Try common attributes
-                for attr in ['num_rows', 'dataset_size', 'size']:
-                    if hasattr(dataset_info, attr):
-                        val = getattr(dataset_info, attr)
-                        print(f"    Found {attr}: {val}")
-                        if isinstance(val, int):
-                            num_rows = val
-                            break
+        
 
             # Separate structured tags (with ':') from user tags
             all_tags = dataset_info.tags or []
             user_tags = [tag for tag in all_tags if ':' not in tag]
             structured_tags = {tag.split(':', 1)[0]: tag.split(':', 1)[1] for tag in all_tags if ':' in tag}
+
+            created_at = getattr(dataset_info, 'created_at', None)
+            last_modified = getattr(dataset_info, 'last_modified', None)
 
             metadata = {
                 'id': dataset_id,
@@ -193,11 +148,11 @@ class DatasetReaderTool:
                 'created_at': created_at.isoformat() if created_at else None,
                 'last_modified': last_modified.isoformat() if last_modified else None,
                 'author': getattr(dataset_info, 'author', ''),
-                'num_rows': num_rows,
-                'features': features,
-                'splits': splits,
-                'download_size': download_size,
-                'dataset_size': dataset_size,
+                'num_rows': None,
+                'features': dataset_info_data.get('features', {}),
+                'splits': None,
+                'download_size': dataset_info_data.get('download_size'),
+                'dataset_size': dataset_info_data.get('dataset_size'),
             }
 
             print(f"✅ Read metadata for {dataset_id}")
@@ -214,80 +169,53 @@ class EvaluatorTool:
     def __init__(self, api_key: str):
         self.client = anthropic.Anthropic(api_key=api_key)
 
-    def calculate_heuristic_score(self, keywords: List[str], metadata: Dict[str, Any]) -> float:
-        """Simple heuristic scoring with keyword relevance"""
+    def calculate_heuristic_score(self, metadata: Dict[str, Any]) -> float:
+        """Quick scoring to prioritize datasets before LLM evaluation (0-1 scale)"""
         score = 0.0
 
-        # Keyword relevance check 
-        # Handle None values for text fields
-        dataset_id = metadata.get('id', '') or ''
-        description = metadata.get('description', '') or ''
-        readme = metadata.get('readme', '') or ''
-
-        dataset_text = f"{dataset_id} {description} {readme}".lower()
+        # Build searchable text from metadata
+        dataset_text = f"{metadata.get('id', '')} {metadata.get('description', '')} {metadata.get('readme', '')}".lower()
         tags_text = ' '.join(metadata.get('tags', [])).lower()
+        combined_text = dataset_text + ' ' + tags_text
 
-        # Expanded keyword matching with semantic relevance
-        # Core terms for deepfake datasets
-        deepfake_terms = ['deepfake', 'deep fake', 'faceswap', 'face swap', 'face-swap',
-                          'face forgery', 'facial forgery', 'deepfakes', 'dfdc', 'faceforensics',
-                          'celeb-df', 'face manipulation', 'video forgery']
+        # All relevant keywords in one list
+        keywords = [
+            'deepfake', 'deep fake', 'deepfakes', 'faceswap', 'face swap', 'face-swap',
+            'face forgery', 'facial forgery', 'face manipulation', 'video forgery',
+            'dfdc', 'faceforensics', 'celeb-df', 'face2face', 'neuraltextures', 'deepfacelab',
+            'synthetic', 'generated', 'gan', 'diffusion', 'stable diffusion', 'stylegan', 'progan',
+            'dalle', 'dall-e', 'midjourney', 'ai-generated', 'ai generated', 'fake face', 'fake image',
+            'detection', 'detector', 'forensic', 'forgery detection', 'authenticity',
+            'biggan', 'vqgan', 'ldm', 'glide', 'flux'
+        ]
 
-        # Core terms for AI-generated imagery
-        ai_gen_terms = ['synthetic', 'generated', 'gan', 'diffusion', 'stable diffusion',
-                       'dalle', 'dall-e', 'midjourney', 'imagen', 'ai-generated',
-                       'ai generated', 'text-to-image', 'text to image', 'aigc',
-                       'fake face', 'fake image', 'generative', 'stylegan']
-
-        # Detection-related terms
-        detection_terms = ['detection', 'detector', 'forensic', 'forgery detection',
-                          'fake detection', 'authenticity', 'manipulation detection']
-
-        # Model names to look for
-        model_names = ['faceswap', 'face2face', 'neuraltextures', 'deepfacelab',
-                      'stylegan', 'progan', 'biggan', 'vqgan', 'ldm', 'glide', 'flux']
-
-        # Combine all relevant terms
-        all_relevant_terms = deepfake_terms + ai_gen_terms + detection_terms + model_names
-
-        # Count keyword matches (original keywords)
-        keyword_matches = sum(1 for kw in keywords if kw.lower() in dataset_text or kw.lower() in tags_text)
-
-        # Count semantic matches (related terms)
-        semantic_matches = sum(1 for term in all_relevant_terms if term.lower() in dataset_text or term.lower() in tags_text)
-
-        # More flexible matching: accept if either keywords OR semantic terms match
-        if keyword_matches == 0 and semantic_matches == 0:
+        # Count keyword matches
+        matches = sum(1 for kw in keywords if kw in combined_text)
+        if matches == 0:
             return 0.0
 
-        # Strong keyword match bonus
-        keyword_ratio = keyword_matches / len(keywords) if keywords else 0
-        score += keyword_ratio * 0.5  # Up to 0.5 points for keyword matches
+        # Keyword relevance (up to 0.5)
+        score += min(matches / 5.0, 1.0) * 0.5
 
-        # Semantic relevance bonus
-        semantic_ratio = min(semantic_matches / 5.0, 1.0)  # Cap at 5 matches
-        score += semantic_ratio * 0.3  # Up to 0.3 points for semantic matches
-
-        # Downloads and likes
+        # Popularity bonus (up to 0.2)
         downloads = metadata.get('downloads', 0)
         if downloads > 1000:
             score += 0.2
         elif downloads > 100:
             score += 0.1
 
-        # Has README
+        # README quality (up to 0.2)
         readme = metadata.get('readme', '')
         if readme and len(readme) > 100:
             score += 0.2
 
-        # Image-related tags
-        image_tags = ['image-classification', 'computer-vision', 'image']
-        if any(tag in metadata.get('tags', []) for tag in image_tags):
+        # Image-related tags (up to 0.1)
+        if any(tag in tags_text for tag in ['image-classification', 'computer-vision', 'image']):
             score += 0.1
 
         return min(score, 1.0)
 
-    def llm_evaluate(self, keywords: List[str], metadata: Dict[str, Any]) -> tuple[bool, str]:
+    def llm_evaluate(self, metadata: Dict[str, Any]) -> tuple[bool, str]:
         """Use LLM to evaluate dataset usefulness"""
         print(f"🤖 LLM evaluating: {metadata['id']}")
 
@@ -366,275 +294,142 @@ REASONING: [2-3 sentence summary]"""
             print(f"❌ LLM evaluation failed: {e}")
             return False, f"Evaluation failed: {e}"
 
-class AgentOrchestrator:
-    """Central orchestrator for the agentic pipeline"""
 
-    def __init__(self, hf_token: Optional[str] = None, anthropic_api_key: Optional[str] = None, db_path: str = "datasets.db"):
+class EmbeddingTool:
+    """Tool for generating text embeddings using HuggingFace Inference API"""
+
+    def __init__(self, hf_token: str, model_id: str = "sentence-transformers/all-MiniLM-L6-v2"):
+        from huggingface_hub import InferenceClient
+        self.client = InferenceClient(token=hf_token)
+        self.model_id = model_id
+
+    def create_embedding_text(self, dataset_id: str, description: str, readme: str, llm_evaluation: str) -> str:
+        """Concatenate fields into a single text for embedding"""
+        parts = [
+            f"Dataset: {dataset_id}",
+            f"Description: {description or 'N/A'}",
+            f"README: {(readme or 'N/A')[:1000]}",
+            f"Evaluation: {(llm_evaluation or 'N/A')[:500]}"
+        ]
+        return " | ".join(parts)
+
+    def get_embedding(self, text: str) -> Optional[List[float]]:
+        """Get embedding vector from HuggingFace Inference API"""
+        try:
+            embedding = self.client.feature_extraction(text, model=self.model_id)
+            if hasattr(embedding, 'tolist'):
+                embedding = embedding.tolist()
+            print(f"✅ Generated embedding (dim={len(embedding)})")
+            return embedding
+        except Exception as e:
+            print(f"❌ Embedding failed: {e}")
+            return None
+
+    def embed_dataset(self, dataset_id: str, metadata: Dict[str, Any], llm_evaluation: Optional[str]) -> Optional[List[float]]:
+        """Generate embedding for a dataset record"""
+        text = self.create_embedding_text(
+            dataset_id=dataset_id,
+            description=metadata.get('description', ''),
+            readme=metadata.get('readme', ''),
+            llm_evaluation=llm_evaluation or ''
+        )
+        return self.get_embedding(text)
+
+
+class DatasetAgent:
+    """True AI agent that decides its own actions - same capabilities as pipeline"""
+
+    def __init__(self):
+        hf_token = os.getenv("HF_TOKEN")
+        api_key = os.getenv("ANTHROPIC_API_KEY")
+        self.client = anthropic.Anthropic(api_key=api_key)
+        self.db = DatasetDatabase("datasets.db")
         self.search_tool = HFSearchTool(hf_token)
         self.reader_tool = DatasetReaderTool(hf_token)
-        self.evaluator = EvaluatorTool(anthropic_api_key) if anthropic_api_key else None
-        self.records: List[DatasetRecord] = []
-        self.db = DatasetDatabase(db_path)
+        self.evaluator = EvaluatorTool(api_key)
+        self.embedding_tool = EmbeddingTool(hf_token)
+        self.pending_datasets = []
 
-    def run_pipeline(self, keywords: List[str], max_datasets: int = 10):
-        """Execute the full pipeline
+        self.tools = [
+            {"name": "search_datasets", "description": "Search HuggingFace for deepfake/AI-generated image datasets",
+             "input_schema": {"type": "object", "properties": {}, "required": []}},
+            {"name": "evaluate_dataset", "description": "Full evaluation: read metadata, scrape, heuristic score, LLM evaluation, embedding, save to DB",
+             "input_schema": {"type": "object", "properties": {"dataset_id": {"type": "string"}}, "required": []}},
+            {"name": "export_data", "description": "Export database to CSV and Google Sheets",
+             "input_schema": {"type": "object", "properties": {}, "required": []}},
+            {"name": "finish", "description": "Stop the agent when task is complete",
+             "input_schema": {"type": "object", "properties": {"reason": {"type": "string"}}, "required": ["reason"]}}
+        ]
 
-        Args:
-            keywords: Keywords to search for
-            max_datasets: Maximum number of datasets to process
-        """
+    def execute_tool(self, name: str, args: dict) -> str:
+        if name == "search_datasets":
+            results = self.search_tool.search_datasets(max_per_keyword=50)
+            self.pending_datasets = [r['id'] for r in results]
+            return f"Found {len(results)} datasets. Pending: {len(self.pending_datasets)}"
 
-        # Step 1: Search
-        datasets = self.search_tool.search_datasets(keywords, max_results=max_datasets)
-
-        for dataset_info in datasets[:max_datasets]:
-            dataset_id = dataset_info['id']
-
-            # Step 2: Read metadata
+        elif name == "evaluate_dataset":
+            dataset_id = args.get("dataset_id") or (self.pending_datasets.pop(0) if self.pending_datasets else None)
+            if not dataset_id:
+                return "No datasets to evaluate"
+            # Same as pipeline: read → scrape → heuristic → LLM eval → embedding → save
             metadata = self.reader_tool.read_dataset(dataset_id)
-
-            if 'error' in metadata:
-                continue
-
-            # Step 3: Evaluate
-            heuristic_score = self.evaluator.calculate_heuristic_score(keywords, metadata) if self.evaluator else 0.5
-            print(f"📊 Heuristic Score: {heuristic_score:.2f}")
-
-            is_useful = False
-            llm_evaluation = None
-
-            # Only proceed if heuristic score > 0 (keyword match required)
-            if self.evaluator and heuristic_score > 0:
-                is_useful, llm_evaluation = self.evaluator.llm_evaluate(keywords, metadata)
-            else:
-                print(f"⏭️  Skipped: No keyword match found")
-
-            if is_useful:
-                # Check if high quality - download and analyze samples
-                image_quality_approved = True  # Default to true for datasets that don't require image check
-
-                if llm_evaluation and 'RELEVANCE: High' in llm_evaluation and 'QUALITY: High' in llm_evaluation:
-                    print(f"🌟 High-quality dataset detected! Downloading 20 sample images for analysis...")
-                    try:
-                        # Get list of files first without downloading
-                        from huggingface_hub import HfFileSystem
-                        fs = HfFileSystem()
-                        files = fs.ls(f"datasets/{dataset_id}", detail=False, recursive=True)
-
-                        # Filter for images
-                        image_files = [f for f in files if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
-
-                        # Sample 20 random images
-                        if len(image_files) > 20:
-                            sampled_files = random.sample(image_files, 20)
-                        else:
-                            sampled_files = image_files
-
-                        # Download only the sampled files
-                        download_dir = f"./datasets/{dataset_id.replace('/', '_')}"
-                        os.makedirs(download_dir, exist_ok=True)
-
-                        sampled = []
-                        for file_path in sampled_files[:20]:
-                            # Extract relative path
-                            rel_path = file_path.replace(f"datasets/{dataset_id}/", "")
-                            local_path = os.path.join(download_dir, os.path.basename(rel_path))
-
-                            # Download single file
-                            from huggingface_hub import hf_hub_download
-                            hf_hub_download(
-                                repo_id=dataset_id,
-                                repo_type="dataset",
-                                filename=rel_path,
-                                local_dir=download_dir,
-                                local_dir_use_symlinks=False
-                            )
-                            sampled.append(local_path)
-
-                        if sampled:
-                            print(f"🔍 Analyzing {len(sampled)} sample images...")
-
-                            approved_count = 0
-                            # Analyze all samples with Claude
-                            for img_path in sampled:
-                                try:
-                                    with Image.open(img_path) as img:
-                                        # Encode image for Claude
-                                        import base64
-                                        import io
-                                        buffered = io.BytesIO()
-                                        img.save(buffered, format="PNG")
-                                        img_str = base64.b64encode(buffered.getvalue()).decode()
-
-                                        # Ask Claude to analyze
-                                        response = self.evaluator.client.messages.create(
-                                            model="claude-3-5-haiku-20241022",
-                                            max_tokens=300,
-                                            messages=[{
-                                                "role": "user",
-                                                "content": [
-                                                    {
-                                                        "type": "image",
-                                                        "source": {
-                                                            "type": "base64",
-                                                            "media_type": "image/png",
-                                                            "data": img_str,
-                                                        },
-                                                    },
-                                                    {
-                                                        "type": "text",
-                                                        "text": "Briefly assess image quality for ML training: resolution, clarity, any visible artifacts/issues? Answer with APPROVED or REJECTED followed by brief reason."
-                                                    }
-                                                ]
-                                            }]
-                                        )
-                                        analysis = response.content[0].text
-                                        if 'APPROVED' in analysis.upper():
-                                            approved_count += 1
-                                        print(f"  Sample {sampled.index(img_path)+1}: {analysis[:100]}...")
-                                except Exception as e:
-                                    print(f"  ⚠️ Could not analyze {img_path}: {e}")
-
-                            approval_rate = approved_count / len(sampled) if sampled else 0
-                            print(f"✅ Image quality check: {approved_count}/{len(sampled)} approved ({approval_rate:.1%})")
-
-                            # Check if majority approved
-                            if approval_rate < 0.5:
-                                print(f"⏭️ Dataset rejected: Only {approval_rate:.1%} of images approved")
-                                image_quality_approved = False
-                    except Exception as e:
-                        print(f"⚠️  Sample analysis failed: {e}")
-                        image_quality_approved = False
-
-                # Only add to database if both useful AND image quality approved
-                if image_quality_approved:
-                    # Create record
-                    record = DatasetRecord(
-                        dataset_id=dataset_id,
-                        discovered_at=datetime.now().isoformat(),
-                        metadata=metadata,
-                        heuristic_score=heuristic_score,
-                        llm_evaluation=llm_evaluation,
-                        is_useful=is_useful,
-                    )
-
-                    self.records.append(record)
-                    print(f"✅ Record created for {dataset_id}")
-
-                    # Save to database
-                    self.db.insert_dataset(asdict(record))
-
-                    # Save results to JSON (legacy)
-                    self.save_results()
-
-    def save_results(self, output_file: str = "dataset_records.json"):
-        """Save structured records to JSON"""
-        with open(output_file, 'w', encoding='utf-8') as f:
-            json.dump([asdict(r) for r in self.records], f, indent=2)
-        print(f"\n💾 Saved {len(self.records)} records to {output_file}")
-
-
-class Scheduler:
-    """Scheduler for running the pipeline periodically"""
-
-    def __init__(self, orchestrator: AgentOrchestrator, config: Dict[str, Any]):
-        """
-        Args:
-            orchestrator: The AgentOrchestrator instance to run
-            config: Configuration dict with keys:
-                - keywords: List[str]
-                - max_datasets: int
-                - interval_hours: int (default: 24)
-        """
-        self.orchestrator = orchestrator
-        self.config = config
-        self.run_count = 0
-
-    def run_job(self):
-        """Execute a single pipeline run"""
-        self.run_count += 1
-        print(f"\n{'='*60}")
-        print(f"🕐 Scheduled Run #{self.run_count} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"{'='*60}\n")
-
-        try:
-            self.orchestrator.run_pipeline(
-                keywords=self.config.get('keywords', ['image']),
-                max_datasets=self.config.get('max_datasets', 10),
+            scraped = scrape_dataset_page(dataset_id)
+            if 'error' not in scraped:
+                metadata['full_readme'] = scraped.get('full_readme')
+                metadata['scraped_data'] = scraped
+            heuristic_score = self.evaluator.calculate_heuristic_score(metadata)
+            is_useful, llm_evaluation = self.evaluator.llm_evaluate(metadata) if heuristic_score >= 5 else (False, None)
+            record = DatasetRecord(
+                dataset_id=dataset_id, discovered_at=datetime.now().isoformat(),
+                metadata=metadata, heuristic_score=heuristic_score,
+                llm_evaluation=llm_evaluation, is_useful=is_useful
             )
-            print(f"\n✅ Scheduled run #{self.run_count} completed successfully")
-        except Exception as e:
-            print(f"\n❌ Scheduled run #{self.run_count} failed: {e}")
+            embedding = self.embedding_tool.embed_dataset(dataset_id, metadata, llm_evaluation)
+            self.db.insert_dataset(asdict(record), embedding=embedding)
+            return f"Saved: {dataset_id} (score={heuristic_score}). Pending: {len(self.pending_datasets)}"
 
-    def start(self, run_immediately: bool = True):
-        """
-        Start the scheduler
+        elif name == "export_data":
+            try:
+                self.db.export_to_google_sheets("1I6xzTmSohoNaQPDd9yDnN8U5WIWRkc3fiS56NTL8BEk")
+                return "Exported to Google Sheets"
+            except Exception as e:
+                return f"Google Sheets export failed: {e}"
 
-        Args:
-            run_immediately: If True, run the pipeline once before starting the schedule
-        """
-        interval_hours = self.config.get('interval_hours', 24)
+        elif name == "finish":
+            return "DONE"
+        return "Unknown tool"
 
-        print(f"\n{'='*60}")
-        print(f"📅 Scheduler Started")
-        print(f"{'='*60}")
-        print(f"⏰ Interval: Every {interval_hours} hour(s)")
-        print(f"🔑 Keywords: {self.config.get('keywords', [])}")
-        print(f"📊 Max Datasets: {self.config.get('max_datasets', 10)}")
-        print(f"{'='*60}\n")
+    def run(self, goal: str = "Find and evaluate deepfake detection datasets", max_steps: int = 500):
+        print(f"🤖 Agent starting with goal: {goal}\n")
+        messages = [{"role": "user", "content": f"Goal: {goal}. Use tools to search, evaluate datasets, check stats, or finish when done."}]
 
-        # Run immediately if requested
-        if run_immediately:
-            print("▶️  Running initial pipeline execution...")
-            self.run_job()
+        for step in range(max_steps):
+            response = self.client.messages.create(
+                model="claude-sonnet-4-20250514", max_tokens=1024,
+                tools=self.tools, messages=messages
+            )
+            if response.stop_reason == "tool_use":
+                for block in response.content:
+                    if block.type == "tool_use":
+                        print(f"Step {step+1}: {block.name}({block.input})")
+                        result = self.execute_tool(block.name, block.input)
+                        print(f"  → {result}\n")
+                        if result == "DONE":
+                            print("✅ Agent finished")
+                            return
+                        messages.append({"role": "assistant", "content": response.content})
+                        messages.append({"role": "user", "content": [{"type": "tool_result", "tool_use_id": block.id, "content": result}]})
+                        # Keep messages under control: first message (goal) + last 30 messages
+                        if len(messages) > 32:
+                            messages = messages[:1] + messages[-30:]
+            else:
+                for block in response.content:
+                    if hasattr(block, 'text'):
+                        print(f"Agent: {block.text}")
+                break
+        print("⚠️ Max steps reached")
 
-        # Schedule periodic runs
-        schedule.every(interval_hours).hours.do(self.run_job)
-
-        print(f"\n⏳ Waiting for next scheduled run in {interval_hours} hour(s)...")
-        print("Press Ctrl+C to stop the scheduler\n")
-
-        # Keep the scheduler running
-        try:
-            while True:
-                schedule.run_pending()
-                time.sleep(60)  # Check every minute
-        except KeyboardInterrupt:
-            pass
-
-
-def main(use_scheduler: bool = False):
-    """Main entry point
-
-    Args:
-        use_scheduler: If True, run as a scheduled service. If False, run once.
-    """
-    # Configuration
-    HF_TOKEN = os.getenv("HF_TOKEN")
-    ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-
-    # Initialize orchestrator
-    orchestrator = AgentOrchestrator(
-        hf_token=HF_TOKEN,
-        anthropic_api_key=ANTHROPIC_API_KEY
-    )
-
-    if use_scheduler:
-        # Scheduled mode - runs periodically
-        scheduler_config = {
-            'keywords': ["deepfake", "synthetic media", "face forgery", "AI generated"],
-            'max_datasets': 20,
-            'interval_hours': 6  # Run every 6 hours (4 times per day)
-        }
-
-        scheduler = Scheduler(orchestrator, scheduler_config)
-        scheduler.start(run_immediately=True)
-    else:
-        # One-time run mode
-        orchestrator.run_pipeline(
-            keywords=["deepfake", "synthetic media", "face forgery", "AI generated"],
-            max_datasets=20,
-        )
 
 if __name__ == "__main__":
-    main()
+    agent = DatasetAgent()
+    agent.run()
